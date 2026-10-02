@@ -2098,3 +2098,232 @@ def test_api_locate_pre_epoch_deep_fraction_is_exact():
     # deep fractional digit.
     assert body["end_at"] == f"1970-01-01T00:00:08.{DEEP_FRAC}Z"
     assert body["offset"] == "0"
+
+
+# ----------------- epoch-adjacent program-time formatting regressions
+
+# A normalized Decimal coefficient drops leading zeros, so a sub-second value
+# at/around the epoch kept fewer coefficient digits than its fraction scale.
+# The second/fraction splitter used to slice without left-padding: a negative
+# fraction (1969-12-31T23:59:59.9999Z -> POSIX -0.0001) ran past the start of
+# the digit tuple (IndexError -> HTTP 500), while a positive fraction
+# (1970-01-01T00:00:00.0001Z -> POSIX 0.0001) misread its own leading zeros
+# as whole seconds and was output magnified tenfold (...:00.1Z).
+EPOCH_PRIMARY = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\n"
+    "https://a.example.com/live/a0.ts\n"
+)
+EPOCH_BACKUP = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\n"
+    "https://b.example.com/live/b0.ts\n"
+)
+
+
+def test_floor_to_second_pads_short_coefficients_at_the_epoch():
+    from app.locate import _floor_to_second
+
+    # Positive sub-second: 0.0001 must not be read as whole second 0 + 0.1.
+    pos = parse_program_time("1970-01-01T00:00:00.0001Z")
+    assert _floor_to_second(pos) == (0, Decimal("0.0001"))
+    # Negative sub-second: -0.0001 floors to -1 with fraction 0.9999; it used
+    # to raise IndexError inside the nine's-complement carry.
+    neg = parse_program_time("1969-12-31T23:59:59.9999Z")
+    whole, fraction = _floor_to_second(neg)
+    assert whole == -1
+    assert fraction == Decimal("0.9999")
+    # Other leading-zero widths the padding has to cover.
+    assert _floor_to_second(Decimal("0.001")) == (0, Decimal("0.001"))
+    assert _floor_to_second(Decimal("-0.001")) == (-1, Decimal("0.999"))
+    assert _floor_to_second(Decimal("0.01")) == (0, Decimal("0.01"))
+    assert _floor_to_second(Decimal("-0.01")) == (-1, Decimal("0.99"))
+
+
+def test_format_program_time_keeps_legal_leading_zero_fractions_at_epoch():
+    # The exact input fraction length survives, including its leading zeros.
+    assert (
+        format_program_time(parse_program_time("1970-01-01T00:00:00.0001Z"))
+        == "1970-01-01T00:00:00.0001Z"
+    )
+    assert (
+        format_program_time(parse_program_time("1969-12-31T23:59:59.9999Z"))
+        == "1969-12-31T23:59:59.9999Z"
+    )
+    # Crossing the epoch by adding a duration lands in the correct second.
+    from app.exactdecimal import exact_add
+
+    pre_epoch = parse_program_time("1969-12-31T23:59:59.9999Z")
+    assert format_program_time(exact_add(pre_epoch, Decimal("0.0002"))) == (
+        "1970-01-01T00:00:00.0001Z"
+    )
+
+
+def test_api_locate_epoch_adjacent_targets_keep_second_and_offset():
+    resp = locate_post(
+        [EPOCH_PRIMARY, EPOCH_PRIMARY],
+        "1970-01-01T00:00:00.0001Z",
+        url=URL_A,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == "1969-12-31T23:59:59Z"
+    assert body["end_at"] == "1970-01-01T00:00:09Z"
+    # One whole second plus the 0.0001 fraction: same-second, not 1.1.
+    assert body["offset"] == "1.0001"
+
+    resp = locate_post(
+        [EPOCH_PRIMARY, EPOCH_PRIMARY],
+        "1969-12-31T23:59:59.9999Z",
+        url=URL_A,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == "1969-12-31T23:59:59Z"
+    assert body["end_at"] == "1970-01-01T00:00:09Z"
+    assert body["offset"] == "0.9999"
+
+
+def test_api_switch_plan_epoch_window_is_200_primary_only():
+    resp = switch_post(
+        URL_A, [EPOCH_PRIMARY, EPOCH_PRIMARY],
+        URL_B, [EPOCH_BACKUP, EPOCH_BACKUP],
+        start="1969-12-31T23:59:59Z",
+        end="1970-01-01T00:00:01Z",
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == "1969-12-31T23:59:59Z"
+    assert body["end_at"] == "1970-01-01T00:00:01Z"
+    assert body["intervals"] == [
+        {
+            "source": "a",
+            "sequence": 0,
+            "uri": "https://a.example.com/live/a0.ts",
+            "start_at": "1969-12-31T23:59:59Z",
+            "end_at": "1970-01-01T00:00:01Z",
+            "offset_start": "0",
+            "offset_end": "2",
+        }
+    ]
+
+
+def test_api_intersect_epoch_adjacent_window_splits_at_epoch_boundary():
+    # Each stream cuts seconds at different boundaries around the epoch: a0
+    # ends exactly at the epoch (1969-...:59.9999 + 0.0001), while b0 spans
+    # the whole 10s. The overlap is therefore split at the epoch, and both
+    # UTC endpoints and in-segment offsets stay exact.
+    primary = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59.9999Z\n#EXTINF:0.0001,\n"
+        "https://a.example.com/live/a0.ts\n"
+        "#EXTINF:10,\nhttps://a.example.com/live/a1.ts\n"
+    )
+    resp = intersect_post(
+        URL_A, [primary, primary],
+        URL_B, [EPOCH_BACKUP, EPOCH_BACKUP],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["intervals"] == [
+        {
+            "sequence_a": 0,
+            "sequence_b": 0,
+            "start_at": "1969-12-31T23:59:59.9999Z",
+            "end_at": "1970-01-01T00:00:00Z",
+            "offset_a": "0",
+            "offset_b": "0.9999",
+        },
+        {
+            "sequence_a": 1,
+            "sequence_b": 0,
+            "start_at": "1970-01-01T00:00:00Z",
+            "end_at": "1970-01-01T00:00:09Z",
+            "offset_a": "0",
+            "offset_b": "1.0000",
+        },
+    ]
+
+
+def test_api_locate_pre_epoch_second_with_overlong_nines_is_exact():
+    # The last pre-epoch second carrying 5000 fractional 9s is POSIX
+    # -0.000...001 (one normalized digit, exponent -5000): the coefficient
+    # splitter must pad, floor to -1, and keep every digit on output.
+    nines = "9" * 5000
+    raw = f"1969-12-31T23:59:59.{nines}Z"
+    snap = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{raw}\n#EXTINF:10,\n"
+        f"{SEG_URL}\n"
+    )
+    resp = locate_post([snap, snap], raw, url=URL_A)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sequence"] == 0
+    assert body["start_at"] == raw
+    assert body["end_at"] == f"1970-01-01T00:00:09.{nines}Z"
+    assert body["offset"] == "0"
+
+
+def test_api_switch_plan_pre_epoch_overlong_nines_primary_only_is_exact():
+    nines = "9" * 5000
+    anchor = f"1969-12-31T23:59:59.{nines}Z"
+    primary = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+        "https://a.example.com/live/a0.ts\n"
+    )
+    resp = switch_post(
+        URL_A, [primary, primary],
+        URL_B, [EPOCH_BACKUP, EPOCH_BACKUP],
+        start=anchor,
+        end="1970-01-01T00:00:00Z",
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == anchor
+    assert body["end_at"] == "1970-01-01T00:00:00Z"
+    assert [item["source"] for item in body["intervals"]] == ["a"]
+    interval = body["intervals"][0]
+    assert interval["start_at"] == anchor
+    assert interval["end_at"] == "1970-01-01T00:00:00Z"
+    assert interval["offset_start"] == "0"
+    # epoch - anchor = 0.(4999 zeros)1: the positive fraction at one ulp.
+    assert interval["offset_end"] == "0." + "0" * 4999 + "1"
+
+
+def test_api_intersect_pre_epoch_overlong_nines_keeps_exact_offsets():
+    nines = "9" * 5000
+    anchor = f"1969-12-31T23:59:59.{nines}Z"
+    one_ulp = "0" * 4999 + "1"
+    # A 0.000...001s first segment ends exactly at the epoch; the following
+    # 10s segment covers past it. The pair with the whole-second backup is
+    # therefore split at the epoch boundary, each side keeping every digit.
+    primary = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n"
+        f"#EXTINF:0.{one_ulp},\nhttps://a.example.com/live/a0.ts\n"
+        "#EXTINF:10,\nhttps://a.example.com/live/a1.ts\n"
+    )
+    resp = intersect_post(
+        URL_A, [primary, primary],
+        URL_B, [EPOCH_BACKUP, EPOCH_BACKUP],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["intervals"] == [
+        {
+            "sequence_a": 0,
+            "sequence_b": 0,
+            "start_at": anchor,
+            "end_at": "1970-01-01T00:00:00Z",
+            "offset_a": "0",
+            "offset_b": "0." + "9" * 5000,
+        },
+        {
+            "sequence_a": 1,
+            "sequence_b": 0,
+            "start_at": "1970-01-01T00:00:00Z",
+            "end_at": "1970-01-01T00:00:09Z",
+            "offset_a": "0",
+            "offset_b": "1." + "0" * 5000,
+        },
+    ]

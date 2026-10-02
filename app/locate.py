@@ -148,6 +148,13 @@ def _floor_to_second(timestamp: Decimal) -> tuple[int, Decimal]:
         return -whole if sign else whole, Decimal(0)
 
     scale = -exponent
+    # A normalized coefficient never carries leading zeros, so a value with no
+    # whole part (|v| < 1) has fewer than ``scale`` digits (e.g. 0.0001 keeps
+    # only (1,)). Pad on the left *before* the split: otherwise the cut slices
+    # past the start (IndexError on negative fractions) or treats the fraction's
+    # own leading digits as whole seconds (0.0001 read as 0.1).
+    if len(digits) < scale:
+        digits = (0,) * (scale - len(digits)) + digits
     whole_digits, remainder_digits = digits[:-scale], digits[-scale:]
     toward_zero = _digits_to_int(whole_digits)
 

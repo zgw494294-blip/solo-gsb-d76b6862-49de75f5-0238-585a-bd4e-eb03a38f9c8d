@@ -550,6 +550,115 @@ PY
 例如 `1969-12-31T23:59:58.000…001Z`（内部为 `-1.999…999`）拆成整秒 `-2` 与
 小数 `0.000…001`，格式化后仍是原时刻，不会被进位/舍入成别的秒。
 
+### 纪元两侧的短小数锚点必须原样输出（回归示例）
+
+纪元附近的亚秒值内部只有很少的系数字节（`0.0001` 归一化后系数只有 `(1,)`，
+前导零只体现在指数上）。秒/小数拆分若不先把系数**左补零到小数位宽**，就会把
+小数自身的前导零误当整秒——`1970-01-01T00:00:00.0001Z`（POSIX `0.0001`）曾
+被放大十倍输出成同秒的 `0.1`；负小数（`1969-12-31T23:59:59.9999Z`，内部
+`-0.0001`）则在九补码进位时越过系数起点触发 `IndexError`（HTTP 500）。三个
+节目时间接口都必须输出**精确的 UTC 端点与片内偏移**。
+
+主路两份快照同序号、同 URI、`EXTINF:10`、锚点完全一致，备路从
+`1969-12-31T23:59:59Z` 起同样覆盖 10 秒；请求窗口 `start_at` 等于主路锚点、
+`end_at` 为 `1970-01-01T00:00:01Z`——主路单独即可铺满，期望 `200` 且**仅选
+主路**：
+
+```bash
+curl -s http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+      ]
+    },
+    "start_at": "1969-12-31T23:59:59Z",
+    "end_at": "1970-01-01T00:00:01Z"
+  }'
+```
+
+```json
+{
+  "start_at": "1969-12-31T23:59:59Z",
+  "end_at": "1970-01-01T00:00:01Z",
+  "intervals": [
+    {"source": "a", "sequence": 0, "uri": "https://a.example.com/live/a0.ts",
+     "start_at": "1969-12-31T23:59:59Z", "end_at": "1970-01-01T00:00:01Z",
+     "offset_start": "0", "offset_end": "2"}
+  ]
+}
+```
+
+纪元后一微秒（`0.0001` 秒，不得放大为 `0.1`）与纪元前 0.1 毫秒（不再触发
+`IndexError`）分别用 `/v1/locate` 复现，二者片内偏移分别精确为 `1.0001`
+与 `0.9999`：
+
+```bash
+curl -s http://localhost:8000/v1/locate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playlist_url": "https://a.example.com/live/index.m3u8",
+    "snapshots": [
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n",
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n"
+    ],
+    "target_at": "1970-01-01T00:00:00.0001Z"
+  }'
+# -> {"sequence": 0, ..., "start_at": "1969-12-31T23:59:59Z",
+#     "end_at": "1970-01-01T00:00:09Z", "offset": "1.0001"}
+```
+
+```bash
+curl -s http://localhost:8000/v1/locate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playlist_url": "https://a.example.com/live/index.m3u8",
+    "snapshots": [
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n",
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n"
+    ],
+    "target_at": "1969-12-31T23:59:59.9999Z"
+  }'
+# -> {"sequence": 0, ..., "start_at": "1969-12-31T23:59:59Z",
+#     "end_at": "1970-01-01T00:00:09Z", "offset": "0.9999"}
+```
+
+纪元前最后一秒接 5000 个 `9` 的锚点（`1969-12-31T23:59:59.999…999Z`，内部
+为 `-0.000…001`，归一化系数只有一位数字、指数 `-5000`）同样必须逐位正确：
+左补零后 floor 到整秒 `-1`、小数 `0.999…999`，`start_at` 原样保留 5000 位，
+加 10 秒后跨过纪元到 `1970-01-01T00:00:09.999…999Z`，全程不经 `int(str)`、
+不用浮点、不调整全局整数转换上限：
+
+```bash
+python - <<'PY' | curl -s http://localhost:8000/v1/locate \
+  -H 'Content-Type: application/json' --data-binary @-
+import json
+
+nines = "9" * 5000
+anchor = f"1969-12-31T23:59:59.{nines}Z"
+snapshot = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+    "https://a.example.com/live/a0.ts\n"
+)
+print(json.dumps({
+    "playlist_url": "https://a.example.com/live/index.m3u8",
+    "snapshots": [snapshot, snapshot],
+    "target_at": anchor,
+}))
+PY
+```
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间
