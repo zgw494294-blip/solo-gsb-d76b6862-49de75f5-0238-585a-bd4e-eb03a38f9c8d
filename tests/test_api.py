@@ -2098,3 +2098,186 @@ def test_api_locate_pre_epoch_deep_fraction_is_exact():
     # deep fractional digit.
     assert body["end_at"] == f"1970-01-01T00:00:08.{DEEP_FRAC}Z"
     assert body["offset"] == "0"
+
+
+# ----------------- epoch-boundary second splitting (short coefficients)
+#
+# Near the POSIX epoch the whole-second part contributes fewer coefficient
+# digits than the fraction scale. Splitting such a coefficient used to drop
+# the implicit leading zeros: 1970-01-01T00:00:00.0001Z (coefficient "1",
+# exponent -4) was rendered as ...00.1Z (the 0.1s of the same second), while
+# the negative instant 23:59:59.9999Z raised IndexError inside the
+# nine's-complement carry and surfaced as HTTP 500.
+
+
+def test_floor_to_second_short_coefficient_epoch_near_fractions():
+    from app.exactdecimal import exact_add
+    from app.locate import _floor_to_second
+
+    # Post-epoch 0.0001: the single coefficient digit must not become 0.1.
+    whole, fraction = _floor_to_second(Decimal("0.0001"))
+    assert (whole, format(fraction, "f")) == (0, "0.0001")
+
+    # Pre-epoch -0.0001 = floor -1 plus positive fraction 0.9999: this used to
+    # raise IndexError while carrying across a one-digit complement list.
+    whole, fraction = _floor_to_second(Decimal("-0.0001"))
+    assert (whole, format(fraction, "f")) == (-1, "0.9999")
+    assert exact_add(Decimal(whole), fraction) == Decimal("-0.0001")
+
+
+def test_format_program_time_epoch_boundary_fractions_round_trip():
+    from app.exactdecimal import exact_add
+
+    assert (
+        format_program_time(parse_program_time("1970-01-01T00:00:00.0001Z"))
+        == "1970-01-01T00:00:00.0001Z"
+    )
+    assert (
+        format_program_time(parse_program_time("1969-12-31T23:59:59.9999Z"))
+        == "1969-12-31T23:59:59.9999Z"
+    )
+    # Derived endpoints keep the leading zeros of the fraction too.
+    assert (
+        format_program_time(
+            exact_add(parse_program_time("1970-01-01T00:00:00.0001Z"), Decimal(10))
+        )
+        == "1970-01-01T00:00:10.0001Z"
+    )
+
+
+def test_pre_epoch_5000_nines_anchor_round_trips_and_extrapolates():
+    # An anchor one ulp before the epoch: POSIX -0.999..999 (5000 nines).
+    # The coefficient is exactly 5000 digits long at exponent -5000, so the
+    # leading-zero padding must not lose, shift or truncate a single digit,
+    # and int<->str conversion is never invoked on the long coefficient.
+    nines = "9" * 5000
+    raw = f"1969-12-31T23:59:59.{nines}Z"
+    timestamp = parse_program_time(raw)
+
+    from app.exactdecimal import exact_add
+    from app.locate import _floor_to_second
+
+    whole, fraction = _floor_to_second(timestamp)
+    assert whole == -1
+    assert format(fraction, "f") == f"0.{nines}"
+    assert format_program_time(timestamp) == raw
+    assert exact_add(Decimal(whole), fraction) == timestamp
+
+    snap = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{raw}\n#EXTINF:10,\n"
+        f"{SEG_URL}\n"
+    )
+    found = locate(BASE_URL, [snap, snap], raw)
+    assert format_program_time(found.start_at) == raw
+    assert format_program_time(found.end_at) == f"1970-01-01T00:00:09.{nines}Z"
+    assert found.offset == 0
+
+
+_EPOCH_PRIMARY = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\n"
+    "https://a.example.com/live/a0.ts\n"
+)
+_EPOCH_BACKUP = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\n"
+    "https://b.example.com/live/b0.ts\n"
+)
+
+
+def test_api_locate_epoch_near_short_fractions_output_exact_endpoints():
+    # One ten-thousandth of a second into the primary segment: the offset must
+    # stay 0.0001 (regression: it was rendered as 0.1 of the same second).
+    resp = locate_post(
+        [_EPOCH_PRIMARY, _EPOCH_PRIMARY],
+        "1970-01-01T00:00:00.0001Z",
+        url=URL_A,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "sequence": 0,
+        "uri": "https://a.example.com/live/a0.ts",
+        "start_at": "1970-01-01T00:00:00Z",
+        "end_at": "1970-01-01T00:00:10Z",
+        "offset": "0.0001",
+    }
+
+    # One ten-thousandth before the epoch, inside the backup segment: this
+    # used to crash response rendering with IndexError (HTTP 500).
+    resp = locate_post(
+        [_EPOCH_BACKUP, _EPOCH_BACKUP],
+        "1969-12-31T23:59:59.9999Z",
+        url=URL_B,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "sequence": 0,
+        "uri": "https://b.example.com/live/b0.ts",
+        "start_at": "1969-12-31T23:59:59Z",
+        "end_at": "1970-01-01T00:00:09Z",
+        "offset": "0.9999",
+    }
+
+
+def test_api_intersect_epoch_near_short_fractions_are_exact():
+    resp = intersect_post(
+        URL_A, [_EPOCH_PRIMARY, _EPOCH_PRIMARY],
+        URL_B, [_EPOCH_BACKUP, _EPOCH_BACKUP],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["intervals"] == [
+        {
+            "sequence_a": 0,
+            "sequence_b": 0,
+            "start_at": "1970-01-01T00:00:00Z",
+            "end_at": "1970-01-01T00:00:09Z",
+            "offset_a": "0",
+            # Backup started one whole second earlier: exactly 1.0000 seconds.
+            "offset_b": "1.0000",
+        }
+    ]
+
+    # Intersection starting 0.0001s inside the primary keeps every digit of
+    # the epoch-near boundary and both in-segment offsets.
+    primary = _EPOCH_PRIMARY.replace(
+        "1970-01-01T00:00:00.0000Z", "1970-01-01T00:00:00.0001Z"
+    )
+    resp = intersect_post(
+        URL_A, [primary, primary],
+        URL_B, [_EPOCH_BACKUP, _EPOCH_BACKUP],
+    )
+    assert resp.status_code == 200, resp.text
+    interval = resp.json()["intervals"][0]
+    assert interval["start_at"] == "1970-01-01T00:00:00.0001Z"
+    assert interval["end_at"] == "1970-01-01T00:00:09Z"
+    assert interval["offset_a"] == "0"
+    assert interval["offset_b"] == "1.0001"
+
+
+def test_api_switch_plan_epoch_window_is_200_primary_only():
+    # Primary anchored exactly at the epoch for 10s; backup covers the second
+    # before the epoch. Window [epoch, epoch+1): primary covers it all, so the
+    # plan is 200 with a single primary interval (the backup must not win even
+    # though it also covers the window), and endpoints/offsets are exact.
+    resp = switch_post(
+        URL_A, [_EPOCH_PRIMARY, _EPOCH_PRIMARY],
+        URL_B, [_EPOCH_BACKUP, _EPOCH_BACKUP],
+        start="1970-01-01T00:00:00.0000Z",
+        end="1970-01-01T00:00:01Z",
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == "1970-01-01T00:00:00Z"
+    assert body["end_at"] == "1970-01-01T00:00:01Z"
+    assert body["intervals"] == [
+        {
+            "source": "a",
+            "sequence": 0,
+            "uri": "https://a.example.com/live/a0.ts",
+            "start_at": "1970-01-01T00:00:00Z",
+            "end_at": "1970-01-01T00:00:01Z",
+            "offset_start": "0",
+            "offset_end": "1.0000",
+        }
+    ]

@@ -550,6 +550,175 @@ PY
 例如 `1969-12-31T23:59:58.000…001Z`（内部为 `-1.999…999`）拆成整秒 `-2` 与
 小数 `0.000…001`，格式化后仍是原时刻，不会被进位/舍入成别的秒。
 
+### 纪元附近的短小数必须逐位输出（回归示例）
+
+纪元附近整秒部分提供的系数位数少于小数位数，秒拆分必须先补回隐式前导零。
+否则有两个故障：
+
+* `1969-12-31T23:59:59.9999Z`（内部 `-0.0001`，负秒补码进位）触发
+  `IndexError`，接口返回 `500`；
+* `1970-01-01T00:00:00.0001Z`（内部 `0.0001`，系数只有一位、指数 `-4`）
+  被丢成同秒的 `0.1` 秒输出。
+
+下例备路锚点为 `1969-12-31T23:59:59Z`、时长 10 秒，主路锚点为纪元整点、
+时长 10 秒。纪元前 0.0001 秒的定位必须返回 `200` 且偏移为 `0.9999`：
+
+```bash
+curl -s http://localhost:8000/v1/locate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playlist_url": "https://b.example.com/live/index.m3u8",
+    "snapshots": [
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n",
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+    ],
+    "target_at": "1969-12-31T23:59:59.9999Z"
+  }'
+```
+
+```json
+{
+  "sequence": 0,
+  "uri": "https://b.example.com/live/b0.ts",
+  "start_at": "1969-12-31T23:59:59Z",
+  "end_at": "1970-01-01T00:00:09Z",
+  "offset": "0.9999"
+}
+```
+
+纪元后 0.0001 秒的定位偏移必须是 `0.0001`，不得放大成 `0.1`：
+
+```bash
+curl -s http://localhost:8000/v1/locate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playlist_url": "https://a.example.com/live/index.m3u8",
+    "snapshots": [
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\nhttps://a.example.com/live/a0.ts\n",
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\nhttps://a.example.com/live/a0.ts\n"
+    ],
+    "target_at": "1970-01-01T00:00:00.0001Z"
+  }'
+```
+
+```json
+{
+  "sequence": 0,
+  "uri": "https://a.example.com/live/a0.ts",
+  "start_at": "1970-01-01T00:00:00Z",
+  "end_at": "1970-01-01T00:00:10Z",
+  "offset": "0.0001"
+}
+```
+
+`/v1/intersect` 的 UTC 端点与片内偏移同样精确（备路提前整 1 秒起播，
+`offset_b` 为 `1.0000`）：
+
+```bash
+curl -s http://localhost:8000/v1/intersect \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\nhttps://a.example.com/live/a0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\nhttps://a.example.com/live/a0.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+      ]
+    }
+  }'
+```
+
+```json
+{
+  "intervals": [
+    {
+      "sequence_a": 0,
+      "sequence_b": 0,
+      "start_at": "1970-01-01T00:00:00Z",
+      "end_at": "1970-01-01T00:00:09Z",
+      "offset_a": "0",
+      "offset_b": "1.0000"
+    }
+  ]
+}
+```
+
+`/v1/switch-plan`：窗口起点等于主路锚点（纪元整点）、终点为
+`1970-01-01T00:00:01Z`。主路在整个窗口内都有已知覆盖，即使备路同样覆盖
+该窗口也必须只选主路，返回 `200`：
+
+```bash
+curl -s http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\nhttps://a.example.com/live/a0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.0000Z\n#EXTINF:10.0,\nhttps://a.example.com/live/a0.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+      ]
+    },
+    "start_at": "1970-01-01T00:00:00.0000Z",
+    "end_at": "1970-01-01T00:00:01Z"
+  }'
+```
+
+```json
+{
+  "start_at": "1970-01-01T00:00:00Z",
+  "end_at": "1970-01-01T00:00:01Z",
+  "intervals": [
+    {
+      "source": "a",
+      "sequence": 0,
+      "uri": "https://a.example.com/live/a0.ts",
+      "start_at": "1970-01-01T00:00:00Z",
+      "end_at": "1970-01-01T00:00:01Z",
+      "offset_start": "0",
+      "offset_end": "1.0000"
+    }
+  ]
+}
+```
+
+纪元前该秒后接 **5000 个 9** 的锚点（内部 `-0.999…999`，恰在纪元前一个
+ulp）也必须逐位输出。小数串太长，用下面的命令生成请求并调用，期望 `200`、
+`start_at` 原样保留 5000 个 9、`end_at` 为 `1970-01-01T00:00:09.` 后接
+5000 个 9、`offset` 为 `0`（不截断、不用浮点、不改动全局整数转换上限）：
+
+```bash
+python - <<'PY' | curl -s http://localhost:8000/v1/locate \
+  -H 'Content-Type: application/json' --data-binary @-
+import json
+
+anchor = f"1969-12-31T23:59:59.{'9' * 5000}Z"
+snapshot = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+    "https://cdn.example.com/live/seg.ts\n"
+)
+print(json.dumps({
+    "playlist_url": "https://cdn.example.com/live/index.m3u8",
+    "snapshots": [snapshot, snapshot],
+    "target_at": anchor,
+}))
+PY
+```
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间

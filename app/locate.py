@@ -148,6 +148,16 @@ def _floor_to_second(timestamp: Decimal) -> tuple[int, Decimal]:
         return -whole if sign else whole, Decimal(0)
 
     scale = -exponent
+    # Near the epoch the whole-second part contributes few (even zero)
+    # coefficient digits, so the coefficient can be shorter than the fraction
+    # scale (e.g. Decimal('0.0001') has one digit at exponent -4, and
+    # Decimal('-0.0001') the same). Splitting without restoring the implicit
+    # leading zeros would turn 0.0001 into 0.1 and, on the negative branch,
+    # index a short complement list past its end. The padding only manipulates
+    # digit tuples, so arbitrarily deep fractions never cross the global
+    # integer string-conversion limit.
+    if len(digits) < scale:
+        digits = (0,) * (scale - len(digits)) + digits
     whole_digits, remainder_digits = digits[:-scale], digits[-scale:]
     toward_zero = _digits_to_int(whole_digits)
 
